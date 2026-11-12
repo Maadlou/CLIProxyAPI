@@ -94,6 +94,10 @@ func weightedSelectorStateModel(ctx context.Context, availabilityModel string) s
 // rolling-window subscription caps (e.g. chat message limits).
 type FillFirstSelector struct{}
 
+// ResetFirstSelector prefers credentials with the earliest observed quota reset.
+// Credentials without reset metadata retain deterministic ordering.
+type ResetFirstSelector struct{}
+
 type blockReason int
 
 const (
@@ -1240,6 +1244,54 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
+}
+
+func (s *ResetFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = opts
+	now := time.Now()
+	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	sort.SliceStable(available, func(i, j int) bool {
+		left, leftOK := earliestQuotaReset(available[i], now)
+		right, rightOK := earliestQuotaReset(available[j], now)
+		if leftOK != rightOK {
+			return leftOK
+		}
+		if leftOK && !left.Equal(right) {
+			return left.Before(right)
+		}
+		return available[i].ID < available[j].ID
+	})
+	return available[0], nil
+}
+
+func earliestQuotaReset(auth *Auth, now time.Time) (time.Time, bool) {
+	if auth == nil {
+		return time.Time{}, false
+	}
+	var earliest time.Time
+	for key, raw := range auth.Quota.Signals {
+		if !strings.Contains(strings.ToLower(key), "reset") {
+			continue
+		}
+		value := strings.TrimSpace(raw)
+		var candidate time.Time
+		if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+			candidate = parsed
+		} else if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds > 0 {
+			candidate = time.Unix(seconds, 0)
+		}
+		if candidate.After(now) && (earliest.IsZero() || candidate.Before(earliest)) {
+			earliest = candidate
+		}
+	}
+	if earliest.IsZero() {
+		return time.Time{}, false
+	}
+	return earliest, true
 }
 
 // IsAuthAvailableForModel reports whether auth is eligible for selection on model at now.

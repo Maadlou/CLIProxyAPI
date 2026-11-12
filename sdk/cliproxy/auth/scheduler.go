@@ -22,6 +22,7 @@ const (
 	schedulerStrategyRoundRobin         schedulerStrategy = 1
 	schedulerStrategyFillFirst          schedulerStrategy = 2
 	schedulerStrategyWeightedRoundRobin schedulerStrategy = 3
+	schedulerStrategyResetFirst         schedulerStrategy = 4
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -173,6 +174,8 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 	switch selector.(type) {
 	case *FillFirstSelector:
 		return schedulerStrategyFillFirst
+	case *ResetFirstSelector:
+		return schedulerStrategyResetFirst
 	case *WeightedRoundRobinSelector:
 		return schedulerStrategyWeightedRoundRobin
 	case nil, *RoundRobinSelector:
@@ -634,7 +637,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 	}
 
-	if strategy == schedulerStrategyFillFirst {
+	if strategy == schedulerStrategyFillFirst || strategy == schedulerStrategyResetFirst {
 		for providerIndex, providerKey := range normalized {
 			shard := candidateShards[providerIndex]
 			if shard == nil {
@@ -1518,6 +1521,8 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	switch strategy {
 	case schedulerStrategyFillFirst:
 		picked = view.pickFirst(predicate)
+	case schedulerStrategyResetFirst:
+		picked = view.pickResetFirst(predicate)
 	case schedulerStrategyWeightedRoundRobin:
 		picked = view.pickWeighted(predicate)
 	default:
@@ -1826,6 +1831,22 @@ func (v *readyView) pickFirst(predicate func(*scheduledAuth) bool) *scheduledAut
 		}
 	}
 	return nil
+}
+
+func (v *readyView) pickResetFirst(predicate func(*scheduledAuth) bool) *scheduledAuth {
+	var best *scheduledAuth
+	var bestReset time.Time
+	bestHasReset := false
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
+			continue
+		}
+		reset, hasReset := earliestQuotaReset(entry.auth, time.Now())
+		if best == nil || (hasReset && !bestHasReset) || (hasReset == bestHasReset && hasReset && reset.Before(bestReset)) || (hasReset == bestHasReset && (!hasReset || reset.Equal(bestReset)) && entry.auth.ID < best.auth.ID) {
+			best, bestReset, bestHasReset = entry, reset, hasReset
+		}
+	}
+	return best
 }
 
 // pickRoundRobin returns the next ready entry using flat round-robin traversal.
